@@ -3,9 +3,9 @@ const std_compat = @import("compat");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
-const protocol_version: i64 = 1;
-const max_line_bytes: usize = 1024 * 1024;
-const max_child_output: usize = 4 * 1024 * 1024;
+const PROTOCOL_VERSION: i64 = 1;
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+const MAX_CHILD_OUTPUT: usize = 4 * 1024 * 1024;
 
 const Options = struct {
     provider: ?[]const u8 = null,
@@ -128,7 +128,7 @@ const Server = struct {
 
         self.initialized = true;
         const result = .{
-            .protocolVersion = protocol_version,
+            .protocolVersion = PROTOCOL_VERSION,
             .agentCapabilities = .{
                 .loadSession = false,
                 .promptCapabilities = .{
@@ -370,7 +370,7 @@ fn serveStdio(allocator: std.mem.Allocator, server: *Server) !void {
         const n = try stdin.read(&read_buffer);
         if (n == 0) break;
 
-        if (pending.items.len + n > max_line_bytes) return error.RequestTooLarge;
+        if (pending.items.len > MAX_LINE_BYTES or n > MAX_LINE_BYTES - pending.items.len) return error.RequestTooLarge;
         try pending.appendSlice(allocator, read_buffer[0..n]);
 
         var start: usize = 0;
@@ -513,7 +513,7 @@ fn invokeNullclaw(
         .allocator = allocator,
         .argv = argv.items,
         .cwd = session.cwd,
-        .max_output_bytes = max_child_output,
+        .max_output_bytes = MAX_CHILD_OUTPUT,
     });
     errdefer allocator.free(result.stdout);
     errdefer allocator.free(result.stderr);
@@ -711,6 +711,54 @@ test "parseOptions accepts ACP forwarding flags" {
     try std.testing.expectEqualStrings("review", options.skill_name.?);
 }
 
+test "handleLine rejects requests before initialize" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{});
+    defer server.deinit();
+
+    const out = try handleLineForTest(
+        allocator,
+        &server,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/prompt\",\"params\":{}}\n",
+    );
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"code\":-32002") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Connection not initialized") != null);
+}
+
+test "handleLine initializes and creates session with absolute cwd" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{});
+    defer server.deinit();
+
+    const cwd = if (builtin.os.tag == .windows) "C:\\tmp\\project" else "/tmp/project";
+    const session_req = try std.json.Stringify.valueAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = 2,
+        .method = "session/new",
+        .params = .{ .cwd = cwd },
+    }, .{});
+    defer allocator.free(session_req);
+
+    const initialized = try handleLineForTest(
+        allocator,
+        &server,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n",
+    );
+    defer allocator.free(initialized);
+    const session_out = try handleLineForTest(allocator, &server, session_req);
+    defer allocator.free(session_out);
+
+    try std.testing.expect(server.initialized);
+    try std.testing.expectEqual(@as(usize, 1), server.sessions.count());
+    try std.testing.expect(std.mem.indexOf(u8, initialized, "\"protocolVersion\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session_out, "\"sessionId\":\"acp-1\"") != null);
+    const stored = server.sessions.get("acp-1").?;
+    try std.testing.expectEqualStrings(cwd, stored.cwd);
+}
+
 test "promptToText extracts text and embedded resources" {
     const allocator = std.testing.allocator;
     const json =
@@ -730,6 +778,16 @@ test "promptToText extracts text and embedded resources" {
     try std.testing.expect(std.mem.indexOf(u8, text, "file:///tmp/a.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "const x = 1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "file:///tmp/b.zig") != null);
+}
+
+fn handleLineForTest(allocator: std.mem.Allocator, server: *Server, line: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    defer out_writer.deinit();
+
+    try server.handleLine(&out_writer.writer, line);
+    out = out_writer.toArrayList();
+    return out.toOwnedSlice(allocator);
 }
 
 test "parseNullclawResponse extracts response field" {

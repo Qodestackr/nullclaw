@@ -405,9 +405,10 @@ const HistoryStoreContext = struct {
     mem_rt: yc.memory.MemoryRuntime,
     session_store: yc.memory.SessionStore,
 
-    fn init(allocator: std.mem.Allocator) !HistoryStoreContext {
+    fn init(allocator: std.mem.Allocator, workspace_override: ?[]const u8) !HistoryStoreContext {
         var cfg = yc.config.Config.load(allocator) catch return error.ConfigNotFound;
         errdefer cfg.deinit();
+        applyHistoryWorkspaceOverride(&cfg, workspace_override);
 
         var history_memory_cfg = buildHistoryMemoryConfig(cfg.memory);
         var mem_rt = yc.memory.initRuntime(allocator, &history_memory_cfg, cfg.workspace_dir) orelse return error.MemoryRuntimeUnavailable;
@@ -427,6 +428,12 @@ const HistoryStoreContext = struct {
         self.* = undefined;
     }
 };
+
+fn applyHistoryWorkspaceOverride(cfg: *yc.config.Config, workspace_override: ?[]const u8) void {
+    if (workspace_override) |workspace| {
+        cfg.workspace_dir = workspace;
+    }
+}
 
 fn runDoctorCommand(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len == 0) {
@@ -691,7 +698,7 @@ fn runAgentInvokeJson(allocator: std.mem.Allocator, sub_args: []const []const u8
         .exited => |code| code == 0,
         else => false,
     }) {
-        var ctx = HistoryStoreContext.init(allocator) catch |err| switch (err) {
+        var ctx = HistoryStoreContext.init(allocator, workspace) catch |err| switch (err) {
             error.ConfigNotFound => {
                 writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
                 std_compat.process.exit(1);
@@ -733,7 +740,7 @@ fn runAgentSessionsAdmin(allocator: std.mem.Allocator, sub_args: []const []const
     const subcmd = sub_args[0];
     const json_mode = hasJsonFlag(sub_args[1..]);
 
-    var ctx = HistoryStoreContext.init(allocator) catch |err| switch (err) {
+    var ctx = HistoryStoreContext.init(allocator, null) catch |err| switch (err) {
         error.ConfigNotFound => {
             if (json_mode) writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
             std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
@@ -5262,6 +5269,32 @@ test "appendAgentInvokeForwardArgs forwards skill option" {
     for (expected, argv.items) |want, got| {
         try std.testing.expectEqualStrings(want, got);
     }
+}
+
+test "appendAgentInvokeForwardArgs forwards workspace option" {
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer argv.deinit(std.testing.allocator);
+
+    try appendAgentInvokeForwardArgs(std.testing.allocator, &argv, "hello", "api:default", .{
+        .workspace = "/tmp/acp-workspace",
+    });
+
+    const expected = [_][]const u8{ "agent", "-m", "hello", "-s", "api:default", "--workspace", "/tmp/acp-workspace" };
+    try std.testing.expectEqual(expected.len, argv.items.len);
+    for (expected, argv.items) |want, got| {
+        try std.testing.expectEqualStrings(want, got);
+    }
+}
+
+test "applyHistoryWorkspaceOverride uses ACP workspace for history reads" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-default",
+        .config_path = "/tmp/nullclaw-default/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    applyHistoryWorkspaceOverride(&cfg, "/tmp/nullclaw-acp");
+    try std.testing.expectEqualStrings("/tmp/nullclaw-acp", cfg.workspace_dir);
 }
 
 test "gatewayHelpRequested detects standalone help flag" {
