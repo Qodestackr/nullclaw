@@ -217,6 +217,19 @@ pub const ChatResponse = struct {
     pub fn contentOrEmpty(self: ChatResponse) []const u8 {
         return self.content orelse "";
     }
+
+    pub fn deinit(self: ChatResponse, allocator: std.mem.Allocator) void {
+        if (self.content) |c| allocator.free(c);
+        if (self.reasoning_content) |rc| allocator.free(rc);
+        if (self.model.len > 0) allocator.free(self.model);
+        if (self.provider.len > 0) allocator.free(self.provider);
+        for (self.tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(self.tool_calls);
+    }
 };
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -37,6 +37,7 @@ const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const streaming = @import("streaming.zig");
 const thread_stacks = @import("thread_stacks.zig");
+const cost_mod = @import("cost.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 const MAX_POST_TURN_INJECTION_DRAINS: u32 = 8;
@@ -275,6 +276,7 @@ pub const SessionManager = struct {
     observer: Observer,
     policy: ?*const SecurityPolicy = null,
     subagent_manager: ?*@import("subagent.zig").SubagentManager = null,
+    cost_tracker: ?cost_mod.CostTracker = null,
 
     /// Result of the startup vision probe against the configured model.
     /// null = not yet confirmed (probe not run, skipped, or inconclusive), true = model accepts images,
@@ -341,12 +343,14 @@ pub const SessionManager = struct {
             .verified_bindings = .{},
             .used_claim_nonces = .{},
             .claim_attempts = .{},
+            .cost_tracker = if (config.cost.enabled) cost_mod.CostTracker.init(allocator, config.workspace_dir, config.cost.enabled, config.cost.daily_limit_usd, config.cost.monthly_limit_usd, config.cost.warn_at_percent) else null,
         };
         manager.loadClaimState();
         return manager;
     }
 
     pub fn deinit(self: *SessionManager) void {
+        if (self.cost_tracker) |*tracker| tracker.deinit();
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit(self.allocator);
@@ -1605,6 +1609,13 @@ pub const SessionManager = struct {
         const now_ts = std_compat.time.timestamp();
         const stat = fs_compat.stat(file) catch return;
         self.initializeUsageLedgerState(&file, stat, now_ts);
+
+        if (self.cost_tracker) |*tracker| {
+            const usage = cost_mod.TokenUsage.fromProviders(record.model, record.usage);
+            tracker.recordUsage(usage) catch |err| {
+                log.err("Failed to record usage in CostTracker: {s}", .{@errorName(err)});
+            };
+        }
 
         const record_line = std.fmt.allocPrint(
             self.allocator,

@@ -250,8 +250,11 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResu
 
 /// Extract `usage` object from an OpenAI-compatible streaming chunk.
 /// The final chunk typically has `choices:[]` and a top-level `usage` object.
+/// OpenAI usage chunks may contain nested objects (prompt_tokens_details,
+/// completion_tokens_details) so we use a generous 32 KB stack buffer.
 fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
-    var buf: [4096]u8 = undefined;
+    // 32 KB is sufficient for OpenAI's nested usage objects.
+    var buf: [32 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const alloc = fba.allocator();
 
@@ -259,20 +262,49 @@ fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
         return null;
     defer parsed.deinit();
 
+    if (parsed.value != .object) return null;
     const obj = parsed.value.object;
     const usage_val = obj.get("usage") orelse return null;
     if (usage_val != .object) return null;
 
     var usage = root.TokenUsage{};
-    if (usage_val.object.get("prompt_tokens")) |v| {
-        if (v == .integer) usage.prompt_tokens = @intCast(v.integer);
+    // Handle prompt_tokens (OpenAI) or input_tokens (Anthropic/some compatible)
+    const prompt_val = usage_val.object.get("prompt_tokens") orelse
+        usage_val.object.get("input_tokens");
+    if (prompt_val) |v| {
+        switch (v) {
+            .integer => |n| usage.prompt_tokens = @intCast(@max(0, n)),
+            .float => |f| usage.prompt_tokens = @intFromFloat(@max(0.0, f)),
+            else => {},
+        }
     }
-    if (usage_val.object.get("completion_tokens")) |v| {
-        if (v == .integer) usage.completion_tokens = @intCast(v.integer);
+
+    const completion_val = usage_val.object.get("completion_tokens") orelse
+        usage_val.object.get("output_tokens");
+    if (completion_val) |v| {
+        switch (v) {
+            .integer => |n| usage.completion_tokens = @intCast(@max(0, n)),
+            .float => |f| usage.completion_tokens = @intFromFloat(@max(0.0, f)),
+            else => {},
+        }
     }
+
     if (usage_val.object.get("total_tokens")) |v| {
-        if (v == .integer) usage.total_tokens = @intCast(v.integer);
+        switch (v) {
+            .integer => |n| usage.total_tokens = @intCast(@max(0, n)),
+            .float => |f| usage.total_tokens = @intFromFloat(@max(0.0, f)),
+            else => {},
+        }
+    } else {
+        usage.total_tokens = usage.prompt_tokens +| usage.completion_tokens;
     }
+
+    // Require at least one non-zero field to treat this as a valid usage chunk.
+    // This guards against "usage":null being coerced into a zero struct.
+    if (usage.prompt_tokens == 0 and usage.completion_tokens == 0 and usage.total_tokens == 0) {
+        return null;
+    }
+
     return usage;
 }
 
@@ -313,7 +345,7 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
             if (val == .string and val.string.len > 0) {
                 return .{ .reasoning = try allocator.dupe(u8, val.string) };
             }
-            if (std.mem.eql(u8, key, "reasoning_details") and val == .object) {
+            if (std.mem.eql(u8, key, "reasoning_details") and val == .array) {
                 if (try root.extractReasoningTextFromDetails(allocator, val)) |text| {
                     return .{ .reasoning = text };
                 }
@@ -940,9 +972,9 @@ test "parseSseLine valid delta" {
     const allocator = std.testing.allocator;
     const result = try parseSseLine(allocator, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
     switch (result) {
-        .delta => |text| {
-            defer allocator.free(text);
-            try std.testing.expectEqualStrings("Hello", text);
+        .delta => |d| {
+            defer d.deinit(allocator);
+            try std.testing.expectEqualStrings("Hello", d.text);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -952,9 +984,9 @@ test "parseSseLine valid delta without optional space" {
     const allocator = std.testing.allocator;
     const result = try parseSseLine(allocator, "data:{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
     switch (result) {
-        .delta => |text| {
-            defer allocator.free(text);
-            try std.testing.expectEqualStrings("Hello", text);
+        .delta => |d| {
+            defer d.deinit(allocator);
+            try std.testing.expectEqualStrings("Hello", d.text);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1053,9 +1085,9 @@ test "parseSseLine invalid JSON" {
 
 test "extractDeltaContent with content" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"world\"}}]}")).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("world", result);
+    const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"world\"}}]}")).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("world", d.text);
 }
 
 test "extractDeltaContent without content" {
@@ -1070,42 +1102,42 @@ test "extractDeltaContent empty content" {
 
 test "extractDeltaContent falls back to reasoning_content when content empty" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"step by step\"}}]}")).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("<think>step by step</think>", result);
+    const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"step by step\"}}]}")).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("step by step", d.reasoning);
 }
 
 // Regression: OpenRouter's documented chat stream uses delta.reasoning.
 test "extractDeltaContent falls back to reasoning when content missing" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning\":\"step by step\"}}]}")).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("<think>step by step</think>", result);
+    const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning\":\"step by step\"}}]}")).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("step by step", d.reasoning);
 }
 
 test "extractDeltaContent falls back to reasoning_content when content missing" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning_content\":\"step by step\"}}]}")).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("<think>step by step</think>", result);
+    const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning_content\":\"step by step\"}}]}")).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("step by step", d.reasoning);
 }
 
 // Regression: OpenRouter's current normalized streaming shape uses reasoning_details.
 test "extractDeltaContent falls back to reasoning_details when content missing" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(
+    const d = (try extractDeltaContent(
         allocator,
         "{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.summary\",\"summary\":\"plan\"},{\"type\":\"reasoning.text\",\"text\":\"step by step\"}]}}]}",
     )).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("<think>plan\nstep by step</think>", result);
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("plan\nstep by step", d.reasoning);
 }
 
 test "extractDeltaContent prefers visible content over reasoning_content" {
     const allocator = std.testing.allocator;
-    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"final answer\",\"reasoning_content\":\"private\"}}]}")).?;
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("final answer", result);
+    const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"final answer\",\"reasoning_content\":\"private\"}}]}")).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("final answer", d.text);
 }
 
 test "extractDeltaContent empty reasoning_content returns null" {
@@ -1246,4 +1278,35 @@ test "parseSseLine extracts usage from final chunk" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+// Regression: OpenAI usage chunks contain nested objects (prompt_tokens_details,
+// completion_tokens_details) that exceeded the old 4096-byte FixedBufferAllocator,
+// silently returning null from extractStreamUsage and causing prompt_tokens=0.
+test "parseSseLine extracts usage from OpenAI nested usage chunk" {
+    const allocator = std.testing.allocator;
+    const line = "data: {\"id\":\"chatcmpl-De08d\",\"object\":\"chat.completion.chunk\"," ++
+        "\"created\":1778426023,\"model\":\"gpt-4o-2024-08-06\"," ++
+        "\"service_tier\":\"default\",\"system_fingerprint\":\"fp_5acb5510d6\"," ++
+        "\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":9,\"total_tokens\":18," ++
+        "\"prompt_tokens_details\":{\"cached_tokens\":0,\"audio_tokens\":0}," ++
+        "\"completion_tokens_details\":{\"reasoning_tokens\":0,\"audio_tokens\":0," ++
+        "\"accepted_prediction_tokens\":0,\"rejected_prediction_tokens\":0}}}";
+    const result = try parseSseLine(allocator, line);
+    switch (result) {
+        .usage => |u| {
+            try std.testing.expectEqual(@as(u32, 9), u.prompt_tokens);
+            try std.testing.expectEqual(@as(u32, 9), u.completion_tokens);
+            try std.testing.expectEqual(@as(u32, 18), u.total_tokens);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "extractStreamUsage returns null for null usage field" {
+    // Intermediate OpenAI chunks have "usage":null — must not produce a zero struct.
+    const json =
+        \\{"id":"chatcmpl-abc","choices":[{"delta":{"content":"Hi"}}],"usage":null}
+    ;
+    try std.testing.expect(extractStreamUsage(json) == null);
 }

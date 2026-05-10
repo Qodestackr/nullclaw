@@ -29,6 +29,7 @@ const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const util = @import("../util.zig");
 const verbose_mod = @import("../verbose.zig");
+const cost_mod = @import("../cost.zig");
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -339,6 +340,8 @@ pub const Agent = struct {
     activation_mode: ActivationMode = .mention,
     send_mode: SendMode = .inherit,
     last_turn_usage: providers.TokenUsage = .{},
+    last_system_prompt_bytes: usize = 0,
+    last_history_bytes: usize = 0,
     status_show_emojis: bool = true,
     message_timeout_secs: u64 = 0,
     log_tool_calls: bool = false,
@@ -399,6 +402,9 @@ pub const Agent = struct {
 
     /// Total tokens used across all turns.
     total_tokens: u64 = 0,
+
+    /// Total cost in USD across all turns.
+    total_cost_usd: f64 = 0,
 
     /// Whether the system prompt has been injected.
     has_system_prompt: bool = false,
@@ -567,6 +573,7 @@ pub const Agent = struct {
             .default_exec_ask = resolved_exec_ask,
             .exec_ask = resolved_exec_ask,
             .history = .empty,
+            .usage_mode = if (cfg.cost.enabled) .full else .off,
             .total_tokens = 0,
             .has_system_prompt = false,
             .last_turn_compacted = false,
@@ -1948,6 +1955,18 @@ pub const Agent = struct {
         // Keep the user message retained even if provider/tool steps fail.
         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
 
+        var sys_bytes: usize = 0;
+        var hist_bytes: usize = 0;
+        for (self.history.items) |msg| {
+            if (msg.role == .system) {
+                sys_bytes += msg.content.len;
+            } else {
+                hist_bytes += msg.content.len;
+            }
+        }
+        self.last_system_prompt_bytes = sys_bytes;
+        self.last_history_bytes = hist_bytes;
+
         // ── Response cache check ──
         if (self.response_cache) |rc| {
             var key_buf: [16]u8 = undefined;
@@ -2283,6 +2302,7 @@ pub const Agent = struct {
             response.usage = normalized_usage;
 
             self.total_tokens += normalized_usage.total_tokens;
+            self.total_cost_usd += cost_mod.TokenUsage.fromProviders(turn_model_name, normalized_usage).cost();
             self.last_turn_usage = normalized_usage;
             if (normalized_usage.total_tokens > 0) {
                 const usage_metric = observability.ObserverMetric{ .tokens_used = normalized_usage.total_tokens };
@@ -2680,6 +2700,7 @@ pub const Agent = struct {
         }
         summary_response.usage = normalized_summary_usage;
         self.total_tokens += normalized_summary_usage.total_tokens;
+        self.total_cost_usd += cost_mod.TokenUsage.fromProviders(self.model_name, normalized_summary_usage).cost();
         self.last_turn_usage = normalized_summary_usage;
         if (normalized_summary_usage.total_tokens > 0) {
             const usage_metric = observability.ObserverMetric{ .tokens_used = normalized_summary_usage.total_tokens };

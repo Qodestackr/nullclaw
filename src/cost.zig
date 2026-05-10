@@ -35,7 +35,46 @@ pub const TokenUsage = struct {
     pub fn cost(self: *const TokenUsage) f64 {
         return self.cost_usd;
     }
+
+    pub fn fromProviders(model: []const u8, usage: anytype) TokenUsage {
+        const pricing = resolvePricing(model);
+        return TokenUsage.init(
+            model,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            pricing.input_usd_per_1m,
+            pricing.output_usd_per_1m,
+        );
+    }
 };
+
+pub const ModelPricing = struct {
+    input_usd_per_1m: f64,
+    output_usd_per_1m: f64,
+};
+
+/// Hardcoded pricing for common models.
+/// Prices are in USD per 1M tokens.
+pub const pricing_table = [_]struct { []const u8, ModelPricing }{
+    .{ "o3-mini", .{ .input_usd_per_1m = 1.10, .output_usd_per_1m = 4.40 } },
+    .{ "gpt-4o", .{ .input_usd_per_1m = 2.50, .output_usd_per_1m = 10.00 } },
+    .{ "gpt-4.5", .{ .input_usd_per_1m = 30.00, .output_usd_per_1m = 60.00 } },
+    .{ "deepseek-v3", .{ .input_usd_per_1m = 0.14, .output_usd_per_1m = 0.28 } },
+    .{ "deepseek-r1", .{ .input_usd_per_1m = 0.14, .output_usd_per_1m = 0.28 } },
+    .{ "claude-3-5-sonnet", .{ .input_usd_per_1m = 3.00, .output_usd_per_1m = 15.00 } },
+    .{ "claude-3-opus", .{ .input_usd_per_1m = 15.00, .output_usd_per_1m = 75.00 } },
+    .{ "claude-3-haiku", .{ .input_usd_per_1m = 0.25, .output_usd_per_1m = 1.25 } },
+};
+
+pub fn resolvePricing(model: []const u8) ModelPricing {
+    for (pricing_table) |entry| {
+        if (std.ascii.indexOfIgnoreCase(model, entry[0]) != null) {
+            return entry[1];
+        }
+    }
+    // Default/fallback pricing (conservative estimate for unknown models)
+    return .{ .input_usd_per_1m = 0.50, .output_usd_per_1m = 1.50 };
+}
 
 /// Time period for cost aggregation.
 pub const UsagePeriod = enum {

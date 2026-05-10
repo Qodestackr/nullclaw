@@ -27,6 +27,8 @@ const OllamaMessage = struct {
 
 const OllamaChatResponse = struct {
     message: OllamaMessage = .{},
+    prompt_eval_count: ?u32 = null,
+    eval_count: ?u32 = null,
 };
 
 // ─── Tool Call Helpers ───────────────────────────────────────────────────────
@@ -288,35 +290,48 @@ pub const OllamaProvider = struct {
     }
 
     /// Parse an Ollama response, handling tool calls, thinking-only, and plain text.
-    pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+    pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ChatResponse {
         const parsed = try std.json.parseFromSlice(OllamaChatResponse, allocator, body, .{
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
         const message = parsed.value.message;
 
+        const usage = root.TokenUsage{
+            .prompt_tokens = parsed.value.prompt_eval_count orelse 0,
+            .completion_tokens = parsed.value.eval_count orelse 0,
+            .total_tokens = (parsed.value.prompt_eval_count orelse 0) +| (parsed.value.eval_count orelse 0),
+        };
+
         // If model returned tool calls, format them for the agent loop
         if (message.tool_calls) |tcs| {
             if (tcs.len > 0) {
-                return formatToolCallsForLoop(allocator, message);
+                const text = try formatToolCallsForLoop(allocator, message);
+                return ChatResponse{ .content = text, .usage = usage };
             }
         }
 
         // Plain text response
         if (message.content) |content| {
             if (content.len > 0) {
-                return try allocator.dupe(u8, content);
+                return ChatResponse{
+                    .content = try allocator.dupe(u8, content),
+                    .usage = usage,
+                };
             }
         }
 
         // Thinking-only response (model reasoned but produced no output)
         if (message.thinking) |thinking| {
             const preview_len = @min(thinking.len, 200);
-            return try std.fmt.allocPrint(
-                allocator,
-                "I was thinking about this: {s}... but I didn't complete my response. Could you try asking again?",
-                .{thinking[0..preview_len]},
-            );
+            return ChatResponse{
+                .content = try std.fmt.allocPrint(
+                    allocator,
+                    "I was thinking about this: {s}... but I didn't complete my response. Could you try asking again?",
+                    .{thinking[0..preview_len]},
+                ),
+                .usage = usage,
+            };
         }
 
         // Empty response
@@ -365,7 +380,9 @@ pub const OllamaProvider = struct {
         const resp_body = root.curlPostTimed(allocator, url, body, headers, 0) catch return error.OllamaApiError;
         defer allocator.free(resp_body);
 
-        return parseResponse(allocator, resp_body);
+        const response = try parseResponse(allocator, resp_body);
+        defer response.deinit(allocator);
+        return try allocator.dupe(u8, response.content orelse "");
     }
 
     fn chatImpl(
@@ -390,8 +407,7 @@ pub const OllamaProvider = struct {
         const resp_body = root.curlPostTimed(allocator, url, body, headers, request.timeout_secs) catch return error.OllamaApiError;
         defer allocator.free(resp_body);
 
-        const text = try parseResponse(allocator, resp_body);
-        return ChatResponse{ .content = text };
+        return parseResponse(allocator, resp_body);
     }
 
     fn streamChatImpl(
@@ -559,8 +575,8 @@ test "parseResponse extracts content" {
         \\{"message":{"role":"assistant","content":"Hello from Ollama!"}}
     ;
     const result = try OllamaProvider.parseResponse(std.testing.allocator, body);
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("Hello from Ollama!", result);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Hello from Ollama!", result.content.?);
 }
 
 test "parseResponse empty content returns NoResponseContent" {
@@ -653,7 +669,7 @@ test "ollama buildChatRequestBody with images" {
     var msgs = [_]root.ChatMessage{
         .{ .role = .user, .content = "Describe this image", .content_parts = cp },
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7, false);
     defer alloc.free(body);
     // Verify valid JSON and images array present
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -672,7 +688,7 @@ test "ollama buildChatRequestBody without content_parts" {
     var msgs = [_]root.ChatMessage{
         root.ChatMessage.user("Hello"),
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llama3" }, "llama3", 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llama3" }, "llama3", 0.7, false);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -690,7 +706,7 @@ test "ollama buildChatRequestBody with data URI image_url extracts base64 payloa
     var msgs = [_]root.ChatMessage{
         .{ .role = .user, .content = "Describe", .content_parts = cp },
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7, false);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -708,7 +724,7 @@ test "ollama buildChatRequestBody skips HTTP URL image_url" {
     var msgs = [_]root.ChatMessage{
         .{ .role = .user, .content = "Describe", .content_parts = cp },
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7, false);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -733,7 +749,7 @@ test "ollama buildChatRequestBody includes native tools" {
         .messages = &msgs,
         .model = "qwen3",
         .tools = tools,
-    }, "qwen3", 0.7);
+    }, "qwen3", 0.7, false);
     defer alloc.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -754,7 +770,7 @@ test "ollama buildChatRequestBody sends think disabled by default" {
     var msgs = [_]root.ChatMessage{
         root.ChatMessage.user("Hello"),
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llama3" }, "llama3", 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llama3" }, "llama3", 0.7, false);
     defer alloc.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"think\":false") != null);
 }
@@ -768,7 +784,7 @@ test "ollama buildChatRequestBody enables think for standard thinking models" {
         .messages = &msgs,
         .model = "qwen3",
         .reasoning_effort = "high",
-    }, "qwen3", 0.7);
+    }, "qwen3", 0.7, false);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -786,7 +802,7 @@ test "ollama buildChatRequestBody maps reasoning_effort to think level for gpt-o
         .messages = &msgs,
         .model = "gpt-oss:20b",
         .reasoning_effort = "xhigh",
-    }, "gpt-oss:20b", 0.7);
+    }, "gpt-oss:20b", 0.7, false);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -927,10 +943,10 @@ test "parseResponse with tool calls produces formatted JSON" {
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","function":{"name":"shell","arguments":{"command":"ls"}}}]}}
     ;
     const result = try OllamaProvider.parseResponse(alloc, body);
-    defer alloc.free(result);
+    defer result.deinit(alloc);
 
     // Should be valid JSON with tool_calls
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.content.?, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("tool_calls") != null);
 }
@@ -941,10 +957,10 @@ test "parseResponse thinking-only returns fallback message" {
         \\{"message":{"role":"assistant","content":"","thinking":"Let me reason about this carefully..."}}
     ;
     const result = try OllamaProvider.parseResponse(alloc, body);
-    defer alloc.free(result);
+    defer result.deinit(alloc);
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "I was thinking about this") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Let me reason") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "I was thinking about this") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "Let me reason") != null);
 }
 
 test "parseResponse with tool_call nested wrapper unwraps correctly" {
@@ -953,12 +969,12 @@ test "parseResponse with tool_call nested wrapper unwraps correctly" {
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"tool_call","arguments":{"name":"shell","arguments":{"command":"whoami"}}}}]}}
     ;
     const result = try OllamaProvider.parseResponse(alloc, body);
-    defer alloc.free(result);
+    defer result.deinit(alloc);
 
     // The formatted output should contain the unwrapped tool name "shell"
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"shell\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"shell\"") != null);
     // And should NOT have "tool_call" as the function name
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"tool_call\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"tool_call\"") == null);
 }
 
 test "parseResponse normalizes scheduler_tool alias to schedule" {
@@ -967,10 +983,10 @@ test "parseResponse normalizes scheduler_tool alias to schedule" {
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"scheduler_tool","arguments":{"action":"list"}}}]}}
     ;
     const result = try OllamaProvider.parseResponse(alloc, body);
-    defer alloc.free(result);
+    defer result.deinit(alloc);
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"schedule\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"scheduler_tool\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"schedule\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"scheduler_tool\"") == null);
 }
 
 test "parseResponse normalizes wrapped scheduler_tool alias to schedule" {
@@ -979,10 +995,10 @@ test "parseResponse normalizes wrapped scheduler_tool alias to schedule" {
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"tool_call","arguments":{"name":"scheduler_tool","arguments":{"action":"list"}}}}]}}
     ;
     const result = try OllamaProvider.parseResponse(alloc, body);
-    defer alloc.free(result);
+    defer result.deinit(alloc);
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"schedule\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"scheduler_tool\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"schedule\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"scheduler_tool\"") == null);
 }
 
 test "jsonEscapeString escapes quotes and backslashes" {

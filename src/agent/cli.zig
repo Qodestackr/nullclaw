@@ -35,6 +35,7 @@ const verbose = @import("../verbose.zig");
 const Agent = @import("root.zig").Agent;
 const turn_persistence = @import("turn_persistence.zig");
 const commands = @import("commands.zig");
+const cost_mod = @import("../cost.zig");
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
@@ -58,6 +59,43 @@ const CliProviderContext = struct {
 
 fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
     return !supports_streaming or !emitted_text;
+}
+
+fn maybePrintUsage(w: anytype, agent: *const Agent) !void {
+    if (agent.usage_mode == .off) return;
+    const usage = agent.last_turn_usage;
+    const cost = @import("../cost.zig").TokenUsage.fromProviders(agent.model_name, usage).cost();
+
+    switch (agent.usage_mode) {
+        .tokens => try w.print("Usage: {d} tokens\n", .{usage.total_tokens}),
+        .cost => try w.print("Usage: ${d:.4}\n", .{cost}),
+        .full => {
+            const total_bytes = agent.last_system_prompt_bytes + agent.last_history_bytes;
+            const sys = if (total_bytes > 0)
+                @as(u32, @intCast((@as(u64, usage.prompt_tokens) * agent.last_system_prompt_bytes) / total_bytes))
+            else
+                0;
+            const usr = usage.prompt_tokens - sys;
+            try w.print("Usage: prompt={d} (rag=~{d} + query=~{d}) completion={d} total={d} (${d:.4}) | Session: ${d:.4}\n", .{
+                usage.prompt_tokens,
+                sys,
+                usr,
+                usage.completion_tokens,
+                usage.total_tokens,
+                cost,
+                agent.total_cost_usd,
+            });
+        },
+        .off => unreachable,
+    }
+}
+
+fn cliUsageRecordCallback(ctx: *anyopaque, record: Agent.UsageRecord) void {
+    const tracker: *cost_mod.CostTracker = @ptrCast(@alignCast(ctx));
+    const usage = cost_mod.TokenUsage.fromProviders(record.model, record.usage);
+    tracker.recordUsage(usage) catch |err| {
+        log.err("Failed to record usage in CostTracker: {s}", .{@errorName(err)});
+    };
 }
 
 fn persistCliTurn(agent: *const Agent, content: []const u8, response: []const u8) void {
@@ -316,6 +354,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     };
     defer cfg.deinit();
+
+    var cost_tracker: ?cost_mod.CostTracker = if (cfg.cost.enabled)
+        cost_mod.CostTracker.init(allocator, cfg.workspace_dir, cfg.cost.enabled, cfg.cost.daily_limit_usd, cfg.cost.monthly_limit_usd, cfg.cost.warn_at_percent)
+    else
+        null;
+    defer if (cost_tracker) |*tracker| tracker.deinit();
 
     const parsed_args = switch (parseAgentArgs(args)) {
         .ok => |parsed| parsed,
@@ -605,6 +649,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else {
             try w.print("\n", .{});
         }
+        try maybePrintUsage(w, &agent);
         try w.flush();
         return;
     }
@@ -662,6 +707,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     agent.session_store = if (mem_rt) |rt| rt.session_store else null;
     agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
     agent.mem_rt = if (mem_rt) |*rt| rt else null;
+
+    if (cost_tracker) |*c_tracker| {
+        agent.usage_record_callback = cliUsageRecordCallback;
+        agent.usage_record_ctx = @ptrCast(c_tracker);
+    }
+
     if (parsed_args.provider_override != null or parsed_args.model_override != null) {
         agent.model_pinned_by_user = true;
     }
@@ -779,6 +830,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else {
             try w.print("\n\n", .{});
         }
+        try maybePrintUsage(w, &agent);
         try w.flush();
     }
 }

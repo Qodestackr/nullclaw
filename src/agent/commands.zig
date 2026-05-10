@@ -88,6 +88,7 @@ const SlashCommandKind = enum {
     skill,
     doctor,
     memory,
+    cost,
     unknown,
 };
 
@@ -130,9 +131,10 @@ fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "elevated") or isSlashName(cmd, "elev")) return .elevated;
     if (isSlashName(cmd, "bash")) return .bash;
     if (isSlashName(cmd, "poll")) return .poll;
-    if (isSlashName(cmd, "skill") or isSlashName(cmd, "skills") or isSlashName(cmd, "iskill")) return .skill;
+    if (isSlashName(cmd, "skill") or isSlashName(cmd, "skills")) return .skill;
     if (isSlashName(cmd, "doctor")) return .doctor;
-    if (isSlashName(cmd, "memory")) return .memory;
+    if (isSlashName(cmd, "memory") or isSlashName(cmd, "mem")) return .memory;
+    if (isSlashName(cmd, "cost") or isSlashName(cmd, "costs") or isSlashName(cmd, "pricing")) return .cost;
     return .unknown;
 }
 
@@ -3708,15 +3710,18 @@ fn handleQueueCommand(self: anytype, arg: []const u8) ![]const u8 {
 fn handleUsageCommand(self: anytype, arg: []const u8) ![]const u8 {
     const mode = firstToken(arg);
     if (mode.len == 0 or std.ascii.eqlIgnoreCase(mode, "status")) {
+        const turn_cost = @import("../cost.zig").TokenUsage.fromProviders(self.model_name, self.last_turn_usage).cost();
         return try std.fmt.allocPrint(
             self.allocator,
-            "Usage: {s}\nLast turn: prompt={d} completion={d} total={d}\nSession total: {d}",
+            "Usage: {s}\nLast turn: prompt={d} completion={d} total={d} (${d:.4})\nSession total: {d} tokens, ${d:.4} total",
             .{
                 self.usage_mode.toSlice(),
                 self.last_turn_usage.prompt_tokens,
                 self.last_turn_usage.completion_tokens,
                 self.last_turn_usage.total_tokens,
+                turn_cost,
                 self.total_tokens,
+                self.total_cost_usd,
             },
         );
     }
@@ -3724,6 +3729,23 @@ fn handleUsageCommand(self: anytype, arg: []const u8) ![]const u8 {
     self.usage_mode = parseUsageMode(@TypeOf(self.usage_mode), mode) orelse
         return try self.allocator.dupe(u8, "Invalid /usage value. Use: off|tokens|full|cost");
     return try std.fmt.allocPrint(self.allocator, "Usage mode set to: {s}", .{self.usage_mode.toSlice()});
+}
+
+fn handleToggleCostCommand(self: anytype, arg: []const u8) ![]const u8 {
+    if (arg.len > 0) {
+        // If argument is provided, behave like /usage
+        return try handleUsageCommand(self, arg);
+    }
+
+    // Toggle logic: off -> full, anything else -> off
+    const new_mode: @TypeOf(self.usage_mode) = if (self.usage_mode == .off) .full else .off;
+    self.usage_mode = new_mode;
+
+    return try std.fmt.allocPrint(
+        self.allocator,
+        "Cost display {s}.",
+        .{if (new_mode == .off) "disabled" else "enabled"},
+    );
 }
 
 fn handleTtsCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -5313,7 +5335,10 @@ pub fn composeFinalReply(
     reasoning_content: ?[]const u8,
     usage: providers.TokenUsage,
 ) ![]const u8 {
-    const show_reasoning = self.reasoning_mode != .off and reasoning_content != null and reasoning_content.?.len > 0;
+    // For reasoning_mode == .stream the thinking content is already printed
+    // live during streaming via ThinkPassthroughFilter, so we must not
+    // prepend it again here. Only .on mode shows the post-turn block.
+    const show_reasoning = self.reasoning_mode == .on and reasoning_content != null and reasoning_content.?.len > 0;
     if (!show_reasoning and self.usage_mode == .off) {
         return try self.allocator.dupe(u8, base_text);
     }
@@ -5507,6 +5532,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .tell => return try handleTellCommand(self, cmd.arg),
         .config => return try handleConfigCommand(self, cmd.arg),
         .capabilities => return try handleCapabilitiesCommand(self, cmd.arg),
+        .cost => return try handleToggleCostCommand(self, cmd.arg),
         .debug => {
             if (std.ascii.eqlIgnoreCase(cmd.arg, "show") or cmd.arg.len == 0) return try formatStatus(self);
             if (std.ascii.eqlIgnoreCase(cmd.arg, "reset")) {
@@ -5813,4 +5839,76 @@ test "activateSkillByName returns false when skill not found" {
     const found = try activateSkillByName(&harness, "ghost-skill");
     try std.testing.expect(!found);
     try std.testing.expect(harness.active_skill_name == null);
+}
+
+// ── composeFinalReply ────────────────────────────────────────────────────────
+
+// Local enum mirrors for testing: composeFinalReply uses `anytype` so it only
+// needs structural compatibility — the values .off / .on / .stream are matched
+// by name, not by type identity.
+const FakeReasoningMode = enum { off, on, stream };
+const FakeUsageMode = enum { off, tokens, full, cost };
+
+const FakeAgent = struct {
+    allocator: std.mem.Allocator,
+    reasoning_mode: FakeReasoningMode = .off,
+    usage_mode: FakeUsageMode = .off,
+    total_tokens: u64 = 0,
+};
+
+test "composeFinalReply off mode returns base text unchanged" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .off };
+    const usage = providers.TokenUsage{};
+    const result = try composeFinalReply(&agent, "Hello", "secret thinking", usage);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello", result);
+}
+
+test "composeFinalReply on mode prepends reasoning block" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .on };
+    const usage = providers.TokenUsage{};
+    const result = try composeFinalReply(&agent, "Answer", "step by step", usage);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.startsWith(u8, result, "Reasoning:\n> step by step\n"));
+    try std.testing.expect(std.mem.endsWith(u8, result, "Answer"));
+}
+
+test "composeFinalReply stream mode does not prepend reasoning block" {
+    // Regression: .stream mode used to show the block twice — once live during
+    // streaming and again via composeFinalReply. Now only .on shows the block.
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .stream };
+    const usage = providers.TokenUsage{};
+    const result = try composeFinalReply(&agent, "Answer", "private chain", usage);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Answer", result);
+}
+
+test "composeFinalReply on mode with null reasoning_content returns base text" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .on };
+    const usage = providers.TokenUsage{};
+    const result = try composeFinalReply(&agent, "Answer", null, usage);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Answer", result);
+}
+
+test "composeFinalReply on mode with empty reasoning_content returns base text" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .on };
+    const usage = providers.TokenUsage{};
+    const result = try composeFinalReply(&agent, "Answer", "", usage);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Answer", result);
+}
+
+test "composeFinalReply appends token usage when usage_mode is tokens" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .off, .usage_mode = .tokens };
+    const usage = providers.TokenUsage{ .total_tokens = 42 };
+    const result = try composeFinalReply(&agent, "Hi", null, usage);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "total_tokens=42") != null);
 }

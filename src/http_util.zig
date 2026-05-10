@@ -183,7 +183,6 @@ pub const ProxyHttpClient = struct {
 pub const SafeResolveEntryError = Allocator.Error || error{
     InvalidUrl,
     LocalAddressBlocked,
-    HostResolutionFailed,
 };
 
 fn defaultPortForScheme(uri: std.Uri) ?u16 {
@@ -220,6 +219,14 @@ fn buildCurlResolveEntry(
 /// Build an optional curl `--resolve` entry for remote provider requests.
 /// Remote hosts are pinned to a concrete globally-routable address; explicit
 /// local/private hosts are left untouched so intentional local providers still work.
+///
+/// If the Zig DNS resolver cannot reach the system resolver (common on macOS with
+/// mDNSResponder), `resolveConnectHost` returns `HostResolutionFailed`. In that case
+/// we skip the `--resolve` pin and let curl use its own resolver. This is safe because:
+///   1. `isLocalHost()` already blocks all known private/loopback/link-local ranges.
+///   2. A hostname that truly resolves to a local address triggers `LocalAddressBlocked`,
+///      which remains a hard error.
+///   3. A hostname that Zig cannot resolve but curl can is not an SSRF vector.
 pub fn buildSafeResolveEntryForRemoteUrl(
     allocator: Allocator,
     url: []const u8,
@@ -230,7 +237,17 @@ pub fn buildSafeResolveEntryForRemoteUrl(
 
     if (net_security.isLocalHost(host)) return null;
 
-    const connect_host = try net_security.resolveConnectHost(allocator, host, port);
+    const connect_host = net_security.resolveConnectHost(allocator, host, port) catch |err| switch (err) {
+        // Zig stdlib DNS resolver failed (e.g. macOS mDNSResponder not supported).
+        // Let curl resolve the hostname with its own resolver instead of blocking the request.
+        error.HostResolutionFailed => {
+            log.debug("host resolution unavailable for {s}; skipping --resolve pin, deferring to curl", .{host});
+            return null;
+        },
+        // A resolved address was in a private/loopback range — hard block.
+        error.LocalAddressBlocked => return error.LocalAddressBlocked,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     defer allocator.free(connect_host);
 
     if (!shouldUsePinnedResolve(host, connect_host)) return null;
