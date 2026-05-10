@@ -97,7 +97,8 @@ FROM alpine:3.23 AS release-base
 
 LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
 
-RUN apk add --no-cache ca-certificates curl docker-cli git make tzdata
+RUN apk add --no-cache ca-certificates curl docker-cli git make bash jq yq python3 nodejs perl tzdata && \
+    ln -sf python3 /usr/bin/python
 
 COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
 COPY --from=config /nullclaw-data /nullclaw-data
