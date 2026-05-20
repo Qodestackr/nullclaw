@@ -32,6 +32,8 @@
 | `nullclaw agent --workspace /path/to/workspace -m "..."` | 本次进程使用指定 workspace 运行 agent |
 | `nullclaw agent --skill news-digest -m "..."` | 在指定 skill 激活的状态下执行单条消息 |
 | `nullclaw agent` | 交互会话模式 |
+| `nullclaw acp` | 启动面向 ACP 兼容编辑器的 stdio 适配器 |
+| `nullclaw acp --provider openai --model gpt-5.2` | 为编辑器启动的 ACP 会话固定 provider/model |
 
 ### 交互式模型路由
 
@@ -45,6 +47,7 @@
 - 如果没有配置 `model_routes`，`/model auto` 仍然会清除 pin，并把会话切回配置里的默认模型。
 - 通过 `--model` 或 `--provider` 启动 `nullclaw agent` 时，也会把该次运行 pin 到显式模型，从而绕过 `model_routes`。
 - 通过 `--skill <name>` 启动 `nullclaw agent` 时，会在第一条消息或 REPL 轮次前激活该 skill。
+- `nullclaw acp` 通过 stdio 使用按行分隔的 JSON-RPC。编辑器创建 ACP 会话时传入绝对 `cwd`；NullClaw 会把它作为 `agent invoke` 的 workspace。
 
 ## 运行与运维
 
@@ -144,6 +147,12 @@
 | `nullclaw workspace edit AGENTS.md` | 用 `$EDITOR` 打开 bootstrap 文件 |
 | `nullclaw workspace reset-md --dry-run` | 预览将要重置的 markdown prompt 文件 |
 | `nullclaw workspace reset-md --include-bootstrap --clear-memory-md` | 重置 bundled markdown，并可附带清理 bootstrap / memory 文件 |
+| `nullclaw workspace audit` | 扫描工作区文件，检测潜在的密钥泄漏（已知 token 前缀、PEM 块、URL 中嵌入的凭据、高熵字符串） |
+| `nullclaw workspace audit --staged \| --commit <sha> \| --range a..b` | 仅扫描已暂存 diff、单个历史提交，或某个 git 修订区间 |
+| `nullclaw workspace audit --json [--only-secrets] [--fail-on <level>]` | 输出机器可读 JSON，达到阈值时返回非零退出码，便于 CI 集成 |
+| `nullclaw workspace audit --llm-triage external` | 通过 `workspace_audit.llm_triage` 或已配置的 primary LLM provider 使用隐私安全 envelope 重新分类（原始密钥值不离开本机） |
+| `nullclaw workspace audit --llm-provider ollama --llm-model qwen2.5-coder:7b --llm-max-calls 20` | 为单次运行覆盖 audit triage 的 provider、model 和外部调用预算 |
+| `nullclaw workspace audit --llm-triage dry-run` | 仅打印将要发送的 envelope，不调用 LLM |
 | `nullclaw capabilities` | 输出运行时能力摘要 |
 | `nullclaw capabilities --json` | 输出 JSON manifest |
 | `nullclaw config show [--json]` | 输出完整的磁盘配置 |
