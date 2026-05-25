@@ -1502,11 +1502,16 @@ pub const Config = struct {
                 try w.print(",\n    \"media\": {{\n      \"audio\": {{\n", .{});
                 try w.print("        \"enabled\": {s}", .{if (am.enabled) "true" else "false"});
                 if (am.language) |lang| {
-                    try w.print(",\n        \"language\": \"{s}\"", .{lang});
+                    try w.print(",\n        \"language\": ", .{});
+                    try writeJsonStr(w, lang);
                 }
-                try w.print(",\n        \"models\": [{{\"provider\": \"{s}\", \"model\": \"{s}\"", .{ am.provider, am.model });
+                try w.print(",\n        \"models\": [{{\"provider\": ", .{});
+                try writeJsonStr(w, am.provider);
+                try w.print(", \"model\": ", .{});
+                try writeJsonStr(w, am.model);
                 if (am.base_url) |bu| {
-                    try w.print(", \"base_url\": \"{s}\"", .{bu});
+                    try w.print(", \"base_url\": ", .{});
+                    try writeJsonStr(w, bu);
                 }
                 try w.print("}}]\n      }}\n    }}", .{});
             }
@@ -4484,11 +4489,11 @@ test "json parse gateway paired tokens" {
 test "json parse gateway configurable limits" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"gateway": {"max_body_size_bytes": 20971520, "request_timeout_secs": 120}}
+        \\{"gateway": {"max_body_size_bytes": 67108864, "request_timeout_secs": 120}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqual(@as(usize, 20 * 1024 * 1024), cfg.gateway.max_body_size_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), cfg.gateway.max_body_size_bytes);
     try std.testing.expectEqual(@as(u64, 120), cfg.gateway.request_timeout_secs);
 }
 
@@ -5766,6 +5771,49 @@ test "save escapes provider string fields" {
     try std.testing.expectEqualStrings("sk-\"quoted\"", openai.get("api_key").?.string);
     try std.testing.expectEqualStrings("https://api.example.com/v1/\"quoted\"", openai.get("base_url").?.string);
     try std.testing.expectEqualStrings("nullclaw \"agent\"", openai.get("user_agent").?.string);
+}
+
+test "save escapes tools media audio string fields" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.secrets.encrypt = false;
+    cfg.audio_media.provider = "local-\"stt";
+    cfg.audio_media.model = "whisper-\"custom";
+    cfg.audio_media.base_url = "https://api.example.com/v1/\"audio";
+    cfg.audio_media.language = "en-\"US";
+
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("tools").?.object;
+    const media = tools.get("media").?.object;
+    const audio = media.get("audio").?.object;
+    const models = audio.get("models").?.array;
+    const model = models.items[0].object;
+
+    try std.testing.expectEqualStrings("en-\"US", audio.get("language").?.string);
+    try std.testing.expectEqualStrings("local-\"stt", model.get("provider").?.string);
+    try std.testing.expectEqualStrings("whisper-\"custom", model.get("model").?.string);
+    try std.testing.expectEqualStrings("https://api.example.com/v1/\"audio", model.get("base_url").?.string);
 }
 
 test "parseJson reads max_streaming_prompt_bytes from provider config" {

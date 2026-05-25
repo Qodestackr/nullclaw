@@ -34,6 +34,8 @@ pub const TranscribeError = error{
 } || std.mem.Allocator.Error;
 
 const TEMP_PATH_ATTEMPTS: usize = 16;
+const TRANSCRIBE_CURL_MAX_TIME_SECS = "120";
+const TRANSCRIBE_CURL_CONNECT_TIMEOUT_SECS = "30";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Transcriber vtable interface
@@ -86,6 +88,37 @@ pub fn resolveTranscriptionEndpoint(provider: []const u8, explicit_endpoint: ?[]
     return "https://api.groq.com/openai/v1/audio/transcriptions";
 }
 
+fn trimTrailingSlash(s: []const u8) []const u8 {
+    var end = s.len;
+    while (end > 0 and s[end - 1] == '/') end -= 1;
+    return s[0..end];
+}
+
+/// Derive an OpenAI-compatible transcription endpoint from a provider base URL.
+/// Explicit `tools.media.audio.models[0].base_url` values remain exact endpoints;
+/// this helper is for `models.providers.<name>.base_url` and `custom:<base>`.
+pub fn transcriptionEndpointFromBaseUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
+    const trimmed = trimTrailingSlash(base_url);
+    if (std.mem.endsWith(u8, trimmed, "/audio/transcriptions")) {
+        return try allocator.dupe(u8, trimmed);
+    }
+    if (std.mem.endsWith(u8, trimmed, "/chat/completions")) {
+        const prefix = trimmed[0 .. trimmed.len - "/chat/completions".len];
+        return std.fmt.allocPrint(allocator, "{s}/audio/transcriptions", .{prefix});
+    }
+    if (hasExplicitApiPath(trimmed)) {
+        return std.fmt.allocPrint(allocator, "{s}/audio/transcriptions", .{trimmed});
+    }
+    return std.fmt.allocPrint(allocator, "{s}/v1/audio/transcriptions", .{trimmed});
+}
+
+fn hasExplicitApiPath(url: []const u8) bool {
+    const after_scheme = if (std.mem.indexOf(u8, url, "://")) |idx| url[idx + 3 ..] else return false;
+    const path_start = std.mem.indexOf(u8, after_scheme, "/") orelse return false;
+    const path = trimTrailingSlash(after_scheme[path_start..]);
+    return path.len > 0 and !std.mem.eql(u8, path, "/");
+}
+
 /// Transcribe an audio file using the Groq Whisper API.
 ///
 /// Reads the file at `file_path`, builds a multipart/form-data request,
@@ -114,17 +147,19 @@ pub fn transcribeFile(
     }
 
     // Build headers
-    var content_type_buf: [128]u8 = undefined;
-    var ct_writer: std.Io.Writer = .fixed(&content_type_buf);
-    ct_writer.print("Content-Type: multipart/form-data; boundary={s}", .{&boundary}) catch
-        return error.BoundaryGenerationFailed;
-    const content_type_hdr = ct_writer.buffered();
+    const content_type_hdr = std.fmt.allocPrint(
+        allocator,
+        "Content-Type: multipart/form-data; boundary={s}",
+        .{&boundary},
+    ) catch return error.BoundaryGenerationFailed;
+    defer allocator.free(content_type_hdr);
 
-    var auth_buf: [256]u8 = undefined;
-    var auth_writer: std.Io.Writer = .fixed(&auth_buf);
-    auth_writer.print("Authorization: Bearer {s}", .{api_key}) catch
-        return error.ApiRequestFailed;
-    const auth_hdr = auth_writer.buffered();
+    const auth_hdr = std.fmt.allocPrint(
+        allocator,
+        "Authorization: Bearer {s}",
+        .{api_key},
+    ) catch return error.ApiRequestFailed;
+    defer allocator.free(auth_hdr);
 
     // POST via curl using --data-binary @tempfile
     const resp = curlPostFromFile(
@@ -299,6 +334,7 @@ fn parseTranscriptionText(allocator: std.mem.Allocator, json_resp: []const u8) !
         return error.InvalidResponse;
     defer parsed.deinit();
 
+    if (parsed.value != .object) return error.InvalidResponse;
     const text_val = parsed.value.object.get("text") orelse return error.InvalidResponse;
     if (text_val != .string) return error.InvalidResponse;
     return try allocator.dupe(u8, text_val.string);
@@ -312,11 +348,8 @@ fn curlPostFromFile(
     file_path: [:0]const u8,
     headers: []const []const u8,
 ) ![]u8 {
-    // Build data-binary arg: @/path/to/file
-    var data_arg_buf: [300]u8 = undefined;
-    var data_writer: std.Io.Writer = .fixed(&data_arg_buf);
-    try data_writer.print("@{s}", .{file_path});
-    const data_arg = data_writer.buffered();
+    const data_arg = try std.fmt.allocPrint(allocator, "@{s}", .{file_path});
+    defer allocator.free(data_arg);
 
     var argv_buf: [32][]const u8 = undefined;
     var argc: usize = 0;
@@ -324,6 +357,14 @@ fn curlPostFromFile(
     argv_buf[argc] = "curl";
     argc += 1;
     argv_buf[argc] = "-s";
+    argc += 1;
+    argv_buf[argc] = "--max-time";
+    argc += 1;
+    argv_buf[argc] = TRANSCRIBE_CURL_MAX_TIME_SECS;
+    argc += 1;
+    argv_buf[argc] = "--connect-timeout";
+    argc += 1;
+    argv_buf[argc] = TRANSCRIBE_CURL_CONNECT_TIMEOUT_SECS;
     argc += 1;
     argv_buf[argc] = "-X";
     argc += 1;
@@ -647,11 +688,42 @@ test "voice parseTranscriptionText non-string text" {
     try std.testing.expectError(error.InvalidResponse, result);
 }
 
+test "voice parseTranscriptionText rejects non-object response" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidResponse, parseTranscriptionText(allocator, "[]"));
+    try std.testing.expectError(error.InvalidResponse, parseTranscriptionText(allocator, "\"text\""));
+}
+
 test "voice parseTranscriptionText empty text" {
     const allocator = std.testing.allocator;
     const text = try parseTranscriptionText(allocator, "{\"text\":\"\"}");
     defer allocator.free(text);
     try std.testing.expectEqualStrings("", text);
+}
+
+test "voice transcriptionEndpointFromBaseUrl derives OpenAI-compatible paths" {
+    const allocator = std.testing.allocator;
+
+    {
+        const endpoint = try transcriptionEndpointFromBaseUrl(allocator, "https://api.example.com");
+        defer allocator.free(endpoint);
+        try std.testing.expectEqualStrings("https://api.example.com/v1/audio/transcriptions", endpoint);
+    }
+    {
+        const endpoint = try transcriptionEndpointFromBaseUrl(allocator, "https://api.example.com/v1");
+        defer allocator.free(endpoint);
+        try std.testing.expectEqualStrings("https://api.example.com/v1/audio/transcriptions", endpoint);
+    }
+    {
+        const endpoint = try transcriptionEndpointFromBaseUrl(allocator, "https://api.example.com/v1/chat/completions");
+        defer allocator.free(endpoint);
+        try std.testing.expectEqualStrings("https://api.example.com/v1/audio/transcriptions", endpoint);
+    }
+    {
+        const endpoint = try transcriptionEndpointFromBaseUrl(allocator, "https://api.example.com/v1/audio/transcriptions/");
+        defer allocator.free(endpoint);
+        try std.testing.expectEqualStrings("https://api.example.com/v1/audio/transcriptions", endpoint);
+    }
 }
 
 test "voice transcribeFile returns error for nonexistent file" {

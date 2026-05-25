@@ -897,7 +897,7 @@ On non-loopback binds, `/pair` only accepts loopback clients; do the initial pai
 | `pair_rate_limit_per_minute` | `10` | Max `/pair` requests per minute per IP |
 | `webhook_rate_limit_per_minute` | `60` | Max webhook-like authenticated requests per minute. Raise this for live `/media/transcribe` audio chunks. |
 | `idempotency_ttl_secs` | `300` | Duration to cache idempotent request results |
-| `max_body_size_bytes` | `65536` | Maximum HTTP request body size in bytes (64 KB). Raise this when accepting image or file payloads (e.g. `20971520` for 20 MB). |
+| `max_body_size_bytes` | `65536` | Maximum HTTP request body size in bytes (64 KB). Raise this when accepting image, audio, or file payloads (e.g. `67108864` for 64 MiB). |
 | `request_timeout_secs` | `30` | Socket read timeout for incoming HTTP requests in seconds. Raise this when accepting large payloads over slow connections. |
 
 ### `tunnel`

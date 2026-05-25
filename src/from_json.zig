@@ -792,7 +792,7 @@ test "applyConfigPatchFields maps generic wizard config fields" {
         \\{
         \\  "gateway": {
         \\    "require_pairing": true,
-        \\    "max_body_size_bytes": 26214400,
+        \\    "max_body_size_bytes": 67108864,
         \\    "request_timeout_secs": 120,
         \\    "webhook_rate_limit_per_minute": 600,
         \\    "idempotency_ttl_secs": 30,
@@ -830,7 +830,7 @@ test "applyConfigPatchFields maps generic wizard config fields" {
 
     try applyConfigPatchFields(&cfg, parsed);
     try std.testing.expect(cfg.gateway.require_pairing);
-    try std.testing.expectEqual(@as(usize, 25 * 1024 * 1024), cfg.gateway.max_body_size_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), cfg.gateway.max_body_size_bytes);
     try std.testing.expectEqual(@as(u64, 120), cfg.gateway.request_timeout_secs);
     try std.testing.expectEqual(@as(u32, 600), cfg.gateway.webhook_rate_limit_per_minute);
     try std.testing.expectEqual(@as(u64, 30), cfg.gateway.idempotency_ttl_secs);

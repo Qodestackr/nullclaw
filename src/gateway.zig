@@ -1097,6 +1097,10 @@ const MediaTranscriptionAccess = struct {
     api_key: []const u8,
     endpoint: []const u8,
     model: []const u8,
+
+    fn deinit(self: *const MediaTranscriptionAccess, allocator: std.mem.Allocator) void {
+        allocator.free(self.endpoint);
+    }
 };
 
 fn supportsAudioTranscriptionProvider(provider: []const u8) bool {
@@ -1111,30 +1115,82 @@ fn defaultAudioTranscriptionModel(provider: []const u8) []const u8 {
     return "whisper-large-v3";
 }
 
-fn resolveMediaTranscriptionAccess(cfg: *const Config) ?MediaTranscriptionAccess {
+fn customProviderBaseUrl(provider: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, provider, "custom:")) return provider["custom:".len..];
+    return null;
+}
+
+fn resolveMediaTranscriptionEndpoint(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    provider: []const u8,
+    explicit_audio_endpoint: ?[]const u8,
+) !?[]u8 {
+    if (explicit_audio_endpoint) |endpoint| return try allocator.dupe(u8, endpoint);
+    if (cfg.getProviderBaseUrl(provider)) |base_url| {
+        return try voice.transcriptionEndpointFromBaseUrl(allocator, base_url);
+    }
+    if (customProviderBaseUrl(provider)) |base_url| {
+        return try voice.transcriptionEndpointFromBaseUrl(allocator, base_url);
+    }
+    if (supportsAudioTranscriptionProvider(provider)) {
+        return try allocator.dupe(u8, voice.resolveTranscriptionEndpoint(provider, null));
+    }
+    return null;
+}
+
+fn resolveMediaAccessForProvider(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    provider: []const u8,
+    model: []const u8,
+    explicit_audio_endpoint: ?[]const u8,
+) !?MediaTranscriptionAccess {
+    const api_key = cfg.getProviderKey(provider) orelse return null;
+    const endpoint = (try resolveMediaTranscriptionEndpoint(allocator, cfg, provider, explicit_audio_endpoint)) orelse return null;
+    errdefer allocator.free(endpoint);
+    return .{
+        .provider = provider,
+        .api_key = api_key,
+        .endpoint = endpoint,
+        .model = model,
+    };
+}
+
+fn mediaProviderAlreadyTried(provider: []const u8, tried: []const []const u8) bool {
+    for (tried) |candidate| {
+        if (std.ascii.eqlIgnoreCase(provider, candidate)) return true;
+    }
+    return false;
+}
+
+fn resolveMediaTranscriptionAccess(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+) !?MediaTranscriptionAccess {
     const configured_provider = cfg.audio_media.provider;
-    if (cfg.getProviderKey(configured_provider)) |api_key| {
-        if (supportsAudioTranscriptionProvider(configured_provider) or cfg.audio_media.base_url != null) {
-            return .{
-                .provider = configured_provider,
-                .api_key = api_key,
-                .endpoint = voice.resolveTranscriptionEndpoint(configured_provider, cfg.audio_media.base_url),
-                .model = cfg.audio_media.model,
-            };
+    if (try resolveMediaAccessForProvider(allocator, cfg, configured_provider, cfg.audio_media.model, cfg.audio_media.base_url)) |access| {
+        return access;
+    }
+
+    const primary_candidates = [_][]const u8{ cfg.default_provider, "openai", "groq", "telnyx" };
+    for (primary_candidates) |provider| {
+        if (std.ascii.eqlIgnoreCase(provider, configured_provider)) continue;
+        const model = if (supportsAudioTranscriptionProvider(provider))
+            defaultAudioTranscriptionModel(provider)
+        else
+            cfg.audio_media.model;
+        if (try resolveMediaAccessForProvider(allocator, cfg, provider, model, null)) |access| {
+            return access;
         }
     }
 
-    const candidates = [_][]const u8{ cfg.default_provider, "openai", "groq", "telnyx" };
-    for (candidates) |provider| {
-        if (!supportsAudioTranscriptionProvider(provider)) continue;
-        if (std.ascii.eqlIgnoreCase(provider, configured_provider)) continue;
-        const api_key = cfg.getProviderKey(provider) orelse continue;
-        return .{
-            .provider = provider,
-            .api_key = api_key,
-            .endpoint = voice.resolveTranscriptionEndpoint(provider, null),
-            .model = defaultAudioTranscriptionModel(provider),
-        };
+    for (cfg.providers) |entry| {
+        if (entry.base_url == null and customProviderBaseUrl(entry.name) == null) continue;
+        if (mediaProviderAlreadyTried(entry.name, primary_candidates[0..]) or std.ascii.eqlIgnoreCase(entry.name, configured_provider)) continue;
+        if (try resolveMediaAccessForProvider(allocator, cfg, entry.name, cfg.audio_media.model, null)) |access| {
+            return access;
+        }
     }
     return null;
 }
@@ -1166,8 +1222,10 @@ fn handleMediaTranscribe(
     };
     defer allocator.free(audio);
 
-    const access = resolveMediaTranscriptionAccess(cfg) orelse
+    const access = (resolveMediaTranscriptionAccess(allocator, cfg) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"audio provider resolution failed\"}" }) orelse
         return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"audio provider key not configured\"}" };
+    defer access.deinit(allocator);
     const language = parsed.value.language orelse cfg.audio_media.language;
 
     const temp_path = writeTempAudioFile(allocator, audio, mime_type) catch
@@ -6031,7 +6089,7 @@ pub fn run(
                 }
             }
         } else if (std.mem.eql(u8, base_path, "/media/transcribe")) {
-            // Local media transcription endpoint used by NullHub-managed clients.
+            // Local media transcription endpoint for gateway clients.
             if (!is_post) {
                 response_status = "405 Method Not Allowed";
                 response_body = "{\"error\":\"method not allowed\"}";
@@ -6312,7 +6370,8 @@ test "media transcription falls back to keyed provider" {
     cfg.audio_media.model = "whisper-large-v3";
     cfg.providers = &entries;
 
-    const access = resolveMediaTranscriptionAccess(&cfg) orelse return error.TestExpectedEqual;
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("openai", access.provider);
     try std.testing.expectEqualStrings("sk-test", access.api_key);
     try std.testing.expectEqualStrings("whisper-1", access.model);
@@ -6330,7 +6389,8 @@ test "media transcription ignores unsupported configured provider without explic
     cfg.audio_media.model = "whisper-large-v3";
     cfg.providers = &entries;
 
-    const access = resolveMediaTranscriptionAccess(&cfg) orelse return error.TestExpectedEqual;
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("openai", access.provider);
     try std.testing.expectEqualStrings("sk-test", access.api_key);
     try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", access.endpoint);
@@ -6346,11 +6406,46 @@ test "media transcription allows custom configured provider with explicit endpoi
     cfg.audio_media.base_url = "http://127.0.0.1:8080/transcribe";
     cfg.providers = &entries;
 
-    const access = resolveMediaTranscriptionAccess(&cfg) orelse return error.TestExpectedEqual;
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("local-stt", access.provider);
     try std.testing.expectEqualStrings("local-key", access.api_key);
     try std.testing.expectEqualStrings("whisper-custom", access.model);
     try std.testing.expectEqualStrings("http://127.0.0.1:8080/transcribe", access.endpoint);
+}
+
+test "media transcription derives endpoint from provider base url" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "openai", .api_key = "sk-test", .base_url = "https://proxy.example/v1" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.audio_media.provider = "openai";
+    cfg.audio_media.model = "whisper-1";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("openai", access.provider);
+    try std.testing.expectEqualStrings("sk-test", access.api_key);
+    try std.testing.expectEqualStrings("whisper-1", access.model);
+    try std.testing.expectEqualStrings("https://proxy.example/v1/audio/transcriptions", access.endpoint);
+}
+
+test "media transcription derives endpoint from custom provider base url" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://stt.example/openai/v1", .api_key = "custom-key" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.audio_media.provider = "custom:https://stt.example/openai/v1";
+    cfg.audio_media.model = "whisper-custom";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("custom:https://stt.example/openai/v1", access.provider);
+    try std.testing.expectEqualStrings("custom-key", access.api_key);
+    try std.testing.expectEqualStrings("whisper-custom", access.model);
+    try std.testing.expectEqualStrings("https://stt.example/openai/v1/audio/transcriptions", access.endpoint);
 }
 
 test "media transcription stages temp file with safe extension" {

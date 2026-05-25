@@ -128,7 +128,7 @@ Teams webhook notes:
 
 ## Media Transcription
 
-`POST /media/transcribe` is intended for local orchestrators such as NullHub. It requires the same bearer-token auth as `/webhook` and `/a2a`, and uses the configured `tools.media.audio` STT model.
+`POST /media/transcribe` is intended for local orchestrators. It requires the same bearer-token auth as `/webhook` and `/a2a`, and uses the configured `tools.media.audio` STT model.
 
 Request:
 
@@ -197,7 +197,7 @@ To accept large image payloads, raise the gateway's HTTP body limit and socket r
 ```json
 {
   "gateway": {
-    "max_body_size_bytes": 20971520,
+    "max_body_size_bytes": 67108864,
     "request_timeout_secs": 120
   }
 }

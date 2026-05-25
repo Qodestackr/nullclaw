@@ -708,7 +708,7 @@ Max 说明：
 | `pair_rate_limit_per_minute` | `10` | 每 IP 每分钟最大 `/pair` 请求数 |
 | `webhook_rate_limit_per_minute` | `60` | 每 IP 每分钟最大 webhook-like 鉴权请求数。实时 `/media/transcribe` 音频分片场景可适当调高。 |
 | `idempotency_ttl_secs` | `300` | 幂等请求结果缓存时长（秒） |
-| `max_body_size_bytes` | `65536` | HTTP 请求体最大字节数（64 KB）。接受图片或文件负载时需调高（如 `20971520` 表示 20 MB）。 |
+| `max_body_size_bytes` | `65536` | HTTP 请求体最大字节数（64 KB）。接受图片、音频或文件负载时需调高（如 `67108864` 表示 64 MiB）。 |
 | `request_timeout_secs` | `30` | 入站 HTTP 请求的 socket 读取超时（秒）。在慢速或高延迟连接下接受大体积负载时需调高。 |
 
 ### `tunnel`
