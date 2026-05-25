@@ -6,6 +6,7 @@ const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
 const model_refs = @import("model_refs.zig");
 const provider_names = @import("provider_names.zig");
+const pairing = @import("security/pairing.zig");
 const secrets = @import("security/secrets.zig");
 pub const config_types = @import("config_types.zig");
 pub const config_parse = @import("config_parse.zig");
@@ -542,6 +543,29 @@ pub const Config = struct {
     fn secretStore(self: *const Config) secrets.SecretStore {
         const config_dir = std_compat.fs.path.dirname(self.config_path) orelse ".";
         return secrets.SecretStore.init(config_dir, self.secrets.encrypt);
+    }
+
+    fn hashGatewayTokensForStorage(allocator: std.mem.Allocator, tokens: []const []const u8) ![]const []const u8 {
+        if (tokens.len == 0) return &.{};
+        const hashed = try allocator.alloc([]const u8, tokens.len);
+        errdefer allocator.free(hashed);
+        var count: usize = 0;
+        errdefer {
+            for (hashed[0..count]) |token| allocator.free(token);
+        }
+        for (tokens) |token| {
+            hashed[count] = if (pairing.isTokenHash(token))
+                try allocator.dupe(u8, token)
+            else
+                try pairing.hashTokenAlloc(allocator, token);
+            count += 1;
+        }
+        return hashed;
+    }
+
+    fn freeGatewayTokensForStorage(allocator: std.mem.Allocator, tokens: []const []const u8) void {
+        for (tokens) |token| allocator.free(token);
+        if (tokens.len > 0) allocator.free(tokens);
     }
 
     fn encryptConfigSecret(
@@ -1359,7 +1383,10 @@ pub const Config = struct {
             self.allocator.free(serialized_memory.api.api_key);
         };
         try writePrettyField(self.allocator, w, "  ", "memory", serialized_memory, ",\n");
-        try writePrettyField(self.allocator, w, "  ", "gateway", self.gateway, ",\n");
+        var serialized_gateway = self.gateway;
+        serialized_gateway.paired_tokens = try hashGatewayTokensForStorage(self.allocator, self.gateway.paired_tokens);
+        defer freeGatewayTokensForStorage(self.allocator, serialized_gateway.paired_tokens);
+        try writePrettyField(self.allocator, w, "  ", "gateway", serialized_gateway, ",\n");
         try writePrettyField(self.allocator, w, "  ", "a2a", self.a2a, ",\n");
         var serialized_tunnel = self.tunnel;
         if (serialized_tunnel.cloudflare) |*cloudflare| {
@@ -2752,6 +2779,8 @@ test "save roundtrip preserves extended config sections" {
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 256 * 1024);
     defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "tok-1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "tok-2") == null);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2822,6 +2851,9 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("/dev/tty.usbmodem1", loaded.hardware.serial_port.?);
     try std.testing.expectEqual(config_types.DmScope.per_peer, loaded.session.dm_scope);
     try std.testing.expectEqual(@as(usize, 1), loaded.session.identity_links.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.gateway.paired_tokens.len);
+    try std.testing.expect(pairing.isTokenHash(loaded.gateway.paired_tokens[0]));
+    try std.testing.expect(!std.mem.eql(u8, "tok-1", loaded.gateway.paired_tokens[0]));
 }
 
 test "save escapes mcp_servers strings safely" {
@@ -2992,8 +3024,10 @@ test "save escapes string arrays safely" {
     try std.testing.expectEqualStrings("provider\"one", loaded.reliability.fallback_providers[0]);
     try std.testing.expectEqualStrings("path\\two", loaded.reliability.fallback_providers[1]);
     try std.testing.expectEqual(@as(u32, 2), loaded.gateway.paired_tokens.len);
-    try std.testing.expectEqualStrings("tok\"one", loaded.gateway.paired_tokens[0]);
-    try std.testing.expectEqualStrings("tok\\two", loaded.gateway.paired_tokens[1]);
+    try std.testing.expect(pairing.isTokenHash(loaded.gateway.paired_tokens[0]));
+    try std.testing.expect(pairing.isTokenHash(loaded.gateway.paired_tokens[1]));
+    try std.testing.expect(!std.mem.eql(u8, "tok\"one", loaded.gateway.paired_tokens[0]));
+    try std.testing.expect(!std.mem.eql(u8, "tok\\two", loaded.gateway.paired_tokens[1]));
 }
 
 test "syncFlatFields propagates nested values" {

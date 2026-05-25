@@ -22,6 +22,8 @@ fn getPid() i32 {
 pub const TranscribeOptions = struct {
     model: []const u8 = "whisper-large-v3",
     language: ?[]const u8 = null,
+    mime_type: []const u8 = "audio/ogg",
+    filename: []const u8 = "audio.ogg",
 };
 
 pub const TranscribeError = error{
@@ -30,6 +32,8 @@ pub const TranscribeError = error{
     ApiRequestFailed,
     InvalidResponse,
 } || std.mem.Allocator.Error;
+
+const TEMP_PATH_ATTEMPTS: usize = 16;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Transcriber vtable interface
@@ -75,9 +79,9 @@ pub const WhisperTranscriber = struct {
 /// Resolve transcription endpoint for a given provider name.
 pub fn resolveTranscriptionEndpoint(provider: []const u8, explicit_endpoint: ?[]const u8) []const u8 {
     if (explicit_endpoint) |ep| return ep;
-    if (std.mem.eql(u8, provider, "openai")) return "https://api.openai.com/v1/audio/transcriptions";
-    if (std.mem.eql(u8, provider, "groq")) return "https://api.groq.com/openai/v1/audio/transcriptions";
-    if (std.mem.eql(u8, provider, "telnyx")) return "https://api.telnyx.com/v2/ai/audio/transcriptions";
+    if (std.ascii.eqlIgnoreCase(provider, "openai")) return "https://api.openai.com/v1/audio/transcriptions";
+    if (std.ascii.eqlIgnoreCase(provider, "groq")) return "https://api.groq.com/openai/v1/audio/transcriptions";
+    if (std.ascii.eqlIgnoreCase(provider, "telnyx")) return "https://api.telnyx.com/v2/ai/audio/transcriptions";
     // For unknown providers, try OpenAI-compatible endpoint
     return "https://api.groq.com/openai/v1/audio/transcriptions";
 }
@@ -100,18 +104,14 @@ pub fn transcribeFile(
     // Build temp file path (platform-aware temp dir)
     const tmp_dir = platform.getTempDir(allocator) catch return error.FileReadFailed;
     defer allocator.free(tmp_dir);
-    var tmp_path_buf: [256]u8 = undefined;
-    var tmp_writer: std.Io.Writer = .fixed(&tmp_path_buf);
-    tmp_writer.print("{s}/nullclaw_voice_{d}.bin", .{ tmp_dir, getPid() }) catch
-        return error.FileReadFailed;
-    const tmp_path_len = tmp_writer.buffered().len;
-    tmp_path_buf[tmp_path_len] = 0;
-    const tmp_path: [:0]const u8 = tmp_path_buf[0..tmp_path_len :0];
 
     // Write multipart body directly to temp file (avoids holding file_data + body in memory)
-    writeMultipartToTempFile(tmp_path, file_path, &boundary, opts) catch
+    const tmp_path = writeMultipartToUniqueTempFile(allocator, tmp_dir, file_path, &boundary, opts) catch
         return error.FileReadFailed;
-    defer std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer {
+        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+        allocator.free(tmp_path);
+    }
 
     // Build headers
     var content_type_buf: [128]u8 = undefined;
@@ -137,6 +137,41 @@ pub fn transcribeFile(
 
     // Parse {"text":"..."} from response
     return parseTranscriptionText(allocator, resp) catch return error.InvalidResponse;
+}
+
+fn tempMultipartPath(allocator: std.mem.Allocator, tmp_dir: []const u8) ![:0]u8 {
+    const raw = try std.fmt.allocPrint(
+        allocator,
+        "{s}{c}nullclaw_voice_{d}_{x}.bin",
+        .{ tmp_dir, std.fs.path.sep, getPid(), std_compat.crypto.random.int(u64) },
+    );
+    defer allocator.free(raw);
+    const path = try allocator.allocSentinel(u8, raw.len, 0);
+    @memcpy(path[0..raw.len], raw);
+    return path;
+}
+
+fn writeMultipartToUniqueTempFile(
+    allocator: std.mem.Allocator,
+    tmp_dir: []const u8,
+    file_path: []const u8,
+    boundary: []const u8,
+    opts: TranscribeOptions,
+) ![:0]u8 {
+    var attempts: usize = 0;
+    while (attempts < TEMP_PATH_ATTEMPTS) : (attempts += 1) {
+        const tmp_path = try tempMultipartPath(allocator, tmp_dir);
+        errdefer allocator.free(tmp_path);
+        writeMultipartToTempFile(tmp_path, file_path, boundary, opts) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(tmp_path);
+                continue;
+            },
+            else => return err,
+        };
+        return tmp_path;
+    }
+    return error.TempFileUnavailable;
 }
 
 /// Generate a random 32-character hex boundary string.
@@ -165,7 +200,11 @@ fn buildMultipartBody(
     // Part: file
     try body.appendSlice(allocator, "--");
     try body.appendSlice(allocator, boundary);
-    try body.appendSlice(allocator, "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n");
+    try body.appendSlice(allocator, "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"");
+    try body.appendSlice(allocator, opts.filename);
+    try body.appendSlice(allocator, "\"\r\nContent-Type: ");
+    try body.appendSlice(allocator, opts.mime_type);
+    try body.appendSlice(allocator, "\r\n\r\n");
     try body.appendSlice(allocator, file_data);
     try body.appendSlice(allocator, "\r\n");
 
@@ -197,18 +236,27 @@ fn buildMultipartBody(
 /// through without building the full body in memory.
 /// This avoids holding both file_data and multipart body in RAM simultaneously.
 fn writeMultipartToTempFile(
-    tmp_path: [:0]const u8,
+    tmp_path: []const u8,
     audio_path: []const u8,
     boundary: []const u8,
     opts: TranscribeOptions,
 ) !void {
-    const tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
+    const tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{
+        .read = false,
+        .truncate = false,
+        .exclusive = true,
+    });
+    errdefer std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
     defer tmp_file.close();
 
     // Write file part header
     try tmp_file.writeAll("--");
     try tmp_file.writeAll(boundary);
-    try tmp_file.writeAll("\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n");
+    try tmp_file.writeAll("\r\nContent-Disposition: form-data; name=\"file\"; filename=\"");
+    try tmp_file.writeAll(opts.filename);
+    try tmp_file.writeAll("\"\r\nContent-Type: ");
+    try tmp_file.writeAll(opts.mime_type);
+    try tmp_file.writeAll("\r\n\r\n");
 
     // Stream audio file directly (no intermediate buffer)
     {
@@ -431,15 +479,32 @@ test "voice TranscribeOptions defaults" {
     const opts = TranscribeOptions{};
     try std.testing.expectEqualStrings("whisper-large-v3", opts.model);
     try std.testing.expect(opts.language == null);
+    try std.testing.expectEqualStrings("audio/ogg", opts.mime_type);
+    try std.testing.expectEqualStrings("audio.ogg", opts.filename);
 }
 
 test "voice TranscribeOptions custom" {
     const opts = TranscribeOptions{
         .model = "whisper-large-v3-turbo",
         .language = "ru",
+        .mime_type = "audio/wav",
+        .filename = "capture.wav",
     };
     try std.testing.expectEqualStrings("whisper-large-v3-turbo", opts.model);
     try std.testing.expectEqualStrings("ru", opts.language.?);
+    try std.testing.expectEqualStrings("audio/wav", opts.mime_type);
+    try std.testing.expectEqualStrings("capture.wav", opts.filename);
+}
+
+test "voice resolveTranscriptionEndpoint is provider case insensitive" {
+    try std.testing.expectEqualStrings(
+        "https://api.openai.com/v1/audio/transcriptions",
+        resolveTranscriptionEndpoint("OpenAI", null),
+    );
+    try std.testing.expectEqualStrings(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        resolveTranscriptionEndpoint("GROQ", null),
+    );
 }
 
 test "voice generateBoundary produces 32 hex chars" {
@@ -498,6 +563,54 @@ test "voice buildMultipartBody without language" {
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "name=\"language\"") == null);
+}
+
+test "voice buildMultipartBody uses requested audio mime and filename" {
+    const allocator = std.testing.allocator;
+    const boundary = "abcdef0123456789abcdef0123456789";
+    const body = try buildMultipartBody(allocator, boundary, "data", .{
+        .mime_type = "audio/wav",
+        .filename = "capture.wav",
+    });
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "filename=\"capture.wav\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Content-Type: audio/wav") != null);
+}
+
+test "voice writeMultipartToTempFile refuses to overwrite existing file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const audio_path = try std.fmt.allocPrint(allocator, "{s}/audio.ogg", .{base});
+    defer allocator.free(audio_path);
+    const target_path = try std.fmt.allocPrint(allocator, "{s}/multipart.bin", .{base});
+    defer allocator.free(target_path);
+
+    {
+        const audio_file = try std_compat.fs.createFileAbsolute(audio_path, .{});
+        defer audio_file.close();
+        try audio_file.writeAll("audio");
+    }
+    {
+        const target_file = try std_compat.fs.createFileAbsolute(target_path, .{});
+        defer target_file.close();
+        try target_file.writeAll("existing");
+    }
+
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        writeMultipartToTempFile(target_path, audio_path, "abcdef0123456789abcdef0123456789", .{}),
+    );
+
+    const target_file = try std_compat.fs.openFileAbsolute(target_path, .{});
+    defer target_file.close();
+    const content = try target_file.readToEndAlloc(allocator, 64);
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("existing", content);
 }
 
 test "voice parseTranscriptionText valid" {

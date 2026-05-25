@@ -29,6 +29,7 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 | `/health` | GET | None | Health check |
 | `/pair` | POST | `X-Pairing-Code` | Exchange one-time pairing code for bearer token (loopback-only when gateway is publicly bound) |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message payload: `{"message":"..."}` |
+| `/media/transcribe` | POST | `Authorization: Bearer <token>` | Transcribe base64 audio payloads through configured STT provider |
 | `/cron` | GET | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | List live scheduler jobs from the running daemon |
 | `/cron/add` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Add or schedule a live cron job |
 | `/cron/remove` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Remove a live cron job by `id` |
@@ -124,6 +125,39 @@ Teams webhook notes:
 - The token issuer must be `https://api.botframework.com`, the audience must match the configured Teams `client_id`, and the token `serviceUrl` must match the activity body.
 - Teams `channelId` endorsements are enforced from the published Bot Framework key metadata.
 - If `channels.teams[].webhook_secret` is configured, `X-Webhook-Secret` must also match exactly.
+
+## Media Transcription
+
+`POST /media/transcribe` is intended for local orchestrators such as NullHub. It requires the same bearer-token auth as `/webhook` and `/a2a`, and uses the configured `tools.media.audio` STT model.
+
+Request:
+
+```json
+{
+  "audio_base64": "BASE64_AUDIO_BYTES",
+  "mime_type": "audio/webm;codecs=opus",
+  "source": "mic",
+  "language": "en"
+}
+```
+
+Response:
+
+```json
+{
+  "text": "transcribed speech",
+  "source": "mic",
+  "language": "en",
+  "mime_type": "audio/webm;codecs=opus"
+}
+```
+
+Notes:
+
+- `audio_base64` is required; `mime_type` defaults to `audio/ogg`.
+- Only `audio/*` MIME types are accepted.
+- Raise `gateway.max_body_size_bytes`, `gateway.request_timeout_secs`, and `gateway.webhook_rate_limit_per_minute` for live desktop audio chunking.
+- `tools.media.audio.models[0]` selects the STT provider/model/endpoint. If that provider has no key, NullClaw falls back to a keyed OpenAI/Groq/Telnyx provider when available.
 
 ## A2A (Agent-to-Agent Protocol)
 
