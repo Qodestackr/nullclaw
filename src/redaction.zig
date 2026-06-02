@@ -651,6 +651,7 @@ fn matchPhone(input: []const u8, pos: usize) ?PhoneMatch {
         }
     }
     if (last_digit_end < input.len and std.ascii.isAlphanumeric(input[last_digit_end])) return null;
+    if (isDateLike(input[pos..last_digit_end])) return null;
     return .{ .start = pos, .end = last_digit_end };
 }
 
@@ -659,6 +660,35 @@ fn firstDigit(input: []const u8) ?u8 {
         if (std.ascii.isDigit(c)) return c;
     }
     return null;
+}
+
+fn isDateLike(raw: []const u8) bool {
+    if (raw.len >= 5) {
+        if (std.ascii.isDigit(raw[0]) and
+            std.ascii.isDigit(raw[1]) and
+            std.ascii.isDigit(raw[2]) and
+            std.ascii.isDigit(raw[3]) and
+            raw[4] == '-')
+        {
+            return true;
+        }
+    }
+    if (raw.len >= 11) {
+        if (std.ascii.isDigit(raw[0]) and
+            std.ascii.isDigit(raw[1]) and
+            raw[2] == '-' and
+            std.ascii.isDigit(raw[3]) and
+            std.ascii.isDigit(raw[4]) and
+            raw[5] == '-' and
+            std.ascii.isDigit(raw[6]) and
+            std.ascii.isDigit(raw[7]) and
+            std.ascii.isDigit(raw[8]) and
+            std.ascii.isDigit(raw[9]))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 const IdMatch = struct { value_start: usize, value_end: usize };
@@ -1177,6 +1207,54 @@ test "Redactor max_identity_entries bounds placeholder maps" {
     const restored = try r.unredact(allocator, "known [EMAIL_1] capped [EMAIL_0]");
     defer allocator.free(restored);
     try std.testing.expectEqualStrings("known a@b.co capped [EMAIL_0]", restored);
+}
+
+test "Redactor ISO datetime preserved — regression for #944" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "Current time: 2026-06-02 20:17 UTC");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("Current time: 2026-06-02 20:17 UTC", out);
+}
+
+test "Redactor ISO datetime DD-MM-YYYY preserved" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "02-06-2026 20:17 UTC");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("02-06-2026 20:17 UTC", out);
+}
+
+test "Redactor full system date string preserved" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "Tue Jun 02 2026-06-02 20:17:00 CST 2026");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "PHONE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2026-06-02") != null);
+}
+
+test "Redactor phone still redacted alongside dates" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "at 2026-06-02 20:17 UTC call (202) 555-1234");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("at 2026-06-02 20:17 UTC call [PHONE_1]", out);
+}
+
+test "Redactor cron heartbeat timestamp preserved" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator,
+        \\ Heartbeat from bot at 2026-06-02 20:17 UTC
+    );
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "PHONE") == null);
 }
 
 test "matchPlaceholderEnd: covers all kinds and rejects look-alikes" {
